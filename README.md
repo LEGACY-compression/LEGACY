@@ -8,8 +8,8 @@ This repository contains the implementation of LEGACY adaptive gradient compress
 
 The gradient compression implementations provided here are based on the following papers:
 
-- AAAI 2020: "On the Discrepancy between Theoretical Analysis and Practical Implementations of Compressed Communication for Distributed Deep Learning"
-- NeurIPS 2021: "Rethinking Gradient Sparsification as Total Error Minimization"
+- AAAI 2020: "On the Discrepancy between Theoretical Analysis and Practical Implementations of Compressed Communication for Distributed Deep Learning", Dutta et al. (https://github.com/sands-lab/layer-wise-aaai20)
+- NeurIPS 2021: "Rethinking Gradient Sparsification as Total Error Minimization", Sahu et al. (https://github.com/sands-lab/rethinking-sparsification)
 
 Refer to the `compressors` folder to review the modifications applied to each implementation. To use these compressors in distributed learning, you simply need to invoke the compressor function before the optimization step. The compressor will handle the compression and aggregation of gradients.
 
