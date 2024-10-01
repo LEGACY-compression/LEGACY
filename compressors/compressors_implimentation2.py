@@ -583,6 +583,320 @@ class AccordionTopKReducer(Reducer):
         return bits_communicated, params_transmitted
 
 
+class VarianceReducer(Reducer):
+    def __init__(self, random_seed, device, timer, parameters, var_alpha=1.5, var_ksi=0.999):
+        super().__init__(random_seed, device, timer)
+        self.var_alpha = var_alpha
+        self.var_ksi = var_ksi
+        self.r = [torch.zeros_like(param).flatten() for param in parameters if param.requires_grad ]
+        self.v = [torch.zeros_like(param).flatten() for param in parameters if param.requires_grad ]
+        self.iter=0
+
+    def reduce(self, parameters, grad_out, memory_out):
+        """
+        Reduce gradients between the workers in place
+        :param grad_in: dictionary
+        :param grad_out: dictionary
+        :param memory_out: dictionary
+        """
+        bits_communicated = 0
+        params_transmitted = 0
+        communicated.append([])
+        with self.timer("reduce.flatpack", verbosity=2):
+            # Find the size of a flatpacked gradient
+            flatgrad_size = 0
+            tensor_idx = [0]
+            all_masks = []
+            for index, tensor in enumerate(parameters):
+                self.r[index]+=tensor.grad_sample.mean(axis=0).flatten()
+                self.v[index]+=tensor.grad_sample.pow(2).mean(axis=0).flatten()
+                mask = (self.r[index]**2) > (self.var_alpha * self.v[index])
+                all_masks.append(mask)
+
+                variance_size = int(mask.sum().item())
+                flatgrad_size += variance_size
+                tensor_idx.append(tensor_idx[-1] + variance_size)
+                communicated[-1].append(variance_size)
+
+            flatgrad_start_idx = tensor_idx[:-1]
+            flatgrad_end_idx = tensor_idx[1:]
+            # print(tensor_idx)
+            flat_values = torch.empty(flatgrad_size, device=self.device)
+            flat_positions = torch.empty(flatgrad_size, device=self.device, dtype=torch.int)
+            # print("non zero size",flatgrad_size, 'layer shape', self.r[index].shape)
+
+        with self.timer("reduce.variance", verbosity=2):
+            for index, (start, end) in enumerate(zip(flatgrad_start_idx, flatgrad_end_idx)):
+                if start==end:
+                    continue
+                mask = all_masks[index]
+                positions = torch.nonzero(mask, as_tuple=False).squeeze()  # Get 1D positions
+                compress_grad = self.r[index] * mask
+                # Use `gather` to index based on positions
+                values = compress_grad.view(-1).gather(0, positions)
+                # positions = torch.nonzero(mask)
+
+                # values = compress_grad.view(-1)[positions].contiguous()
+                flat_values[start:end] = values
+                flat_positions[start:end] = positions
+                # Set r and v to zero where the condition is not met
+                inverse_mask = ~mask
+                self.r[index] = self.r[index]* inverse_mask
+                self.v[index] = self.var_ksi*self.v[index] * inverse_mask
+
+        # with self.timer("reduce.memory", verbosity=2):  # varaince compression save memory in r
+        #     for tensor, mem, start, end in zip(
+        #         grad_in, memory_out, flatgrad_start_idx, flatgrad_end_idx
+        #     ):
+        #         positions = flat_positions[start:end]
+        #         mem.data[:] = tensor
+        #         mem.view(-1)[positions.long()] = 0.0
+        with self.timer("reduce.gather.context", verbosity=2):
+            flatgrad_size = torch.tensor(flatgrad_size, device = self.device)
+            flatgrad_start_idx = torch.tensor(flatgrad_start_idx, device = self.device)
+            flatgrad_end_idx = torch.tensor(flatgrad_end_idx, device = self.device)
+            if self.n_workers > 1:
+                gathered_sizes = [torch.empty_like(flatgrad_size) for i in range(self.n_workers)]
+                h1 = all_gather(gathered_sizes, flatgrad_size, async_op = True)
+                gathered_start_indices = [torch.empty_like(flatgrad_start_idx) for i in range(self.n_workers)]
+                h2 = all_gather(gathered_start_indices, flatgrad_start_idx, async_op = True)
+                gathered_end_indices = [torch.empty_like(flatgrad_end_idx) for i in range(self.n_workers)]
+                h3 = all_gather(gathered_end_indices, flatgrad_end_idx, async_op = True)
+                h1.wait()
+                h2.wait()
+                h3.wait()
+            else:
+                gathered_sizes = [flatgrad_size]
+                gathered_start_indices = [flatgrad_start_idx]
+                gathered_end_indices = [flatgrad_end_idx]
+                
+        with self.timer("reduce.pad", verbosity=2):
+            if self.n_workers > 1:
+                max_size = max(gathered_sizes)
+                if flatgrad_size != max_size:
+                    padding_values = torch.empty(max_size-flatgrad_size, dtype=flat_values.dtype, device=flat_values.device)
+                    padding_positions = torch.empty(max_size-flatgrad_size, dtype=flat_positions.dtype, device=flat_values.device)
+                    flat_values = torch.cat((flat_values, padding_values), dim=0)
+                    flat_positions = torch.cat((flat_positions, padding_positions), dim=0)
+
+
+        with self.timer("reduce.gather", verbosity=2):
+            if self.n_workers > 1:
+                start_time = time.time()
+                self.iter+=1
+                worker_values = [torch.empty_like(flat_values) for i in range(self.n_workers)]
+                worker_positions = [torch.empty_like(flat_positions) for i in range(self.n_workers)]
+                # all_gather(worker_values, flat_values)
+                # all_gather(worker_positions, flat_positions)
+                h1 = all_gather(worker_values, flat_values, async_op=True)
+                h2 = all_gather(worker_positions, flat_positions, async_op=True)
+                h1.wait()
+                h2.wait()
+                # torch.distributed.barrier()
+                elapsed_time = time.time() - start_time
+            else:
+                worker_values = [flat_values]
+                worker_positions = [flat_positions]
+           
+            bits_communicated = n_bits(flat_values) + n_bits(flat_positions)
+            params_transmitted = flat_values.numel()
+            
+        with self.timer("reduce.combine", verbosity=2):
+            for out, start_indices, end_indices in zip(
+                grad_out, zip(*gathered_start_indices), zip(*gathered_end_indices)
+            ):
+                out.data[:] = 0
+                for pos, val, start, end in zip(worker_positions, worker_values, start_indices, end_indices):
+                    positions = pos[start:end]
+                    values = val[start:end]
+                    # out.view(-1)[pos].add_(1.0 / self.n_workers, val)
+                    out.view(-1)[positions.long()] += values / self.n_workers
+        simulate_network_transfer(bits_communicated)
+        return bits_communicated, params_transmitted
+
+
+
+class GlobalCATReducer(Reducer):
+    def __init__(self, random_seed, device, timer, c_0 = 1, c_1 = 60, P_max = 1460): #c_0 = 576, c_1 = 64, P_max = 512
+        super().__init__(random_seed, device, timer)
+        self.c_0 = c_0
+        self.c_1 = c_1
+        self.P_max = P_max
+
+        self.tau_max = math.floor(self.P_max/64)  # the number of gradient components (+ index) that can fit within a single communication packet
+        print('tau max', self.tau_max, 'P_max', P_max)
+    def reduce(self, grad_in, grad_out, memory_out):
+        """
+        Reduce gradients between the workers in place
+        :param grad_in: dictionary
+        :param grad_out: dictionary
+        :param memory_out: dictionary
+        """
+        bits_communicated = 0
+        params_transmitted = 0
+        communicated.append([])
+        with self.timer("reduce.flatpack"):
+            # Find the size of a flatpacked gradient
+            flatgrad_size = 0
+            tensor_idx = [0]
+            for tensor in grad_in:
+                n = tensor.nelement()
+                flatgrad_size += n
+                tensor_idx.append(tensor_idx[-1] + n)
+            flatgrad_start_idx = tensor_idx[:-1]
+            flatgrad_end_idx = tensor_idx[1:]
+            flatgrad = torch.empty(flatgrad_size, device=self.device)
+
+            # Pack the flatgrad
+            for tensor, start, end in zip(grad_in, flatgrad_start_idx, flatgrad_end_idx):
+                flatgrad[start:end] = tensor.view(-1)
+
+        with self.timer("reduce.CAT", verbosity=2):
+            sorted_abs_values = torch.sort(torch.abs(flatgrad), descending=True).values
+            squared_values = sorted_abs_values.pow(2)
+            total_sum_squares = squared_values.sum()
+            log_d = math.ceil(math.log2(flatgrad.nelement()))
+            max_nb_iter = math.ceil(flatgrad.nelement()/self.tau_max)
+            cumulative_sum = 0.0
+            previous_ratio = 0.0
+            #### Packet model
+            # for i in range(max_nb_iter):
+            #     cumulative_sum += squared_values[i*self.tau_max: (i+1)*self.tau_max].sum()
+            #     nb_element = min((i+1)*self.tau_max, flatgrad.nelement())
+            #     current_ratio = cumulative_sum / (total_sum_squares*(self.communication_cost(nb_element, log_d)))
+            #     if i > 0 and current_ratio < previous_ratio:
+            #         break  # The current index is T since the ratio decreased
+            #     previous_ratio = current_ratio
+
+            # top_size = min((i+1)*self.tau_max, flatgrad.nelement())
+
+            for i, value in enumerate(squared_values):
+                cumulative_sum += value
+                current_ratio = cumulative_sum / (total_sum_squares*(self.communication_cost(i+1, log_d)))
+                if i > 0 and current_ratio < previous_ratio:
+                    break  # The current index is T since the ratio decreased
+                previous_ratio = current_ratio
+            top_size = i
+            communicated[-1].append(top_size)
+            _, positions = torch.topk(flatgrad.abs(), top_size, sorted=False)
+            values = flatgrad[positions].contiguous()
+            # print('calculated',positions.max())
+            flat_values = values
+            flat_positions = positions
+
+
+        with self.timer("reduce.gather.context", verbosity=2):
+            flatgrad_size = torch.tensor(top_size, device = self.device)
+            # flatgrad_start_idx = torch.tensor(flatgrad_start_idx, device = self.device)
+            # flatgrad_end_idx = torch.tensor(flatgrad_end_idx, device = self.device)
+            if self.n_workers > 1:
+                gathered_sizes = [torch.empty_like(flatgrad_size) for i in range(self.n_workers)]
+                h1 = all_gather(gathered_sizes, flatgrad_size, async_op = True)
+                # gathered_start_indices = [torch.empty_like(flatgrad_start_idx) for i in range(self.n_workers)]
+                # h2 = all_gather(gathered_start_indices, flatgrad_start_idx, async_op = True)
+                # gathered_end_indices = [torch.empty_like(flatgrad_end_idx) for i in range(self.n_workers)]
+                # h3 = all_gather(gathered_end_indices, flatgrad_end_idx, async_op = True)
+                h1.wait()
+                # h2.wait()
+                # h3.wait()
+            else:
+                gathered_sizes = [flatgrad_size]
+                # gathered_start_indices = [flatgrad_start_idx]
+                # gathered_end_indices = [flatgrad_end_idx]
+        with self.timer("reduce.pad", verbosity=2):
+            if self.n_workers > 1:
+                max_size = max(gathered_sizes)
+                if flatgrad_size != max_size:
+                    padding_values = torch.zeros(max_size-flatgrad_size, dtype=values.dtype, device=values.device)
+                    padding_positions = torch.zeros(max_size-flatgrad_size, dtype=positions.dtype, device=positions.device)
+                    flat_values = torch.cat((values, padding_values), dim=0)
+                    flat_positions = torch.cat((positions, padding_positions), dim=0)
+                    # print('pading', flat_positions.max)
+
+
+        
+        with self.timer("reduce.gather.tensors", verbosity=2):
+            if self.n_workers > 1:
+                worker_values = [torch.zeros_like(flat_values) for i in range(self.n_workers)]
+                worker_positions = [torch.zeros_like(flat_positions) for i in range(self.n_workers)]
+                # print('before',worker_positions[0].max(), worker_positions[1].max(), flat_positions.max())
+                h1 = all_gather(worker_values, flat_values, async_op=True)
+                h2 = all_gather(worker_positions, flat_positions, async_op=True)
+                h1.wait()
+                h2.wait()
+            else:
+                worker_values = [flat_values]
+                worker_positions = [flat_positions]
+            bits_communicated = n_bits(flat_values) + n_bits(flat_positions)
+            params_transmitted = flat_values.numel()
+        # print('after',worker_positions[0].max(), worker_positions[1].max())
+        with self.timer("reduce.combine", verbosity=2):
+            # Flatten the gradients into one tensor
+            flat_grad = torch.cat([g.view(-1) for g in grad_out])
+            # print('combine')
+            flat_grad.zero_()
+            for pos, val in zip(worker_positions, worker_values):
+                # print(f"flat_grad size: {flat_grad.size()}, pos shape: {pos.shape}, pos max: {pos.max()}, val {val.shape}")
+                flat_grad[pos] += val/ self.n_workers
+
+            # Reshape the flattened gradient back into per-layer format
+            offset = 0
+
+            for i, g in enumerate(grad_out):
+                num_elements = g.numel()
+                grad_out[i] = flat_grad[offset:offset + num_elements].view_as(g)
+                offset += num_elements
+
+    
+            # grad_out.data[:] = 0
+            # for pos, val in zip(worker_positions, worker_values):
+            #     # positions = pos[start:end]
+            #     # values = val[start:end]
+            #     # out.view(-1)[pos].add_(1.0 / self.n_workers, val)
+            #     grad_out.view(-1)[pos] += val / self.n_workers
+            #     print(grad_out[:10], pos[:10], val[:10])
+            #     print('----')
+        simulate_network_transfer(bits_communicated)
+
+        # with self.timer("reduce.memory", verbosity=2):
+        #     for tensor, mem, positions in zip(
+        #         grad_in, memory_out, compressed_positions
+        #     ):
+        #         mem.data[:] = tensor
+        #         mem.view(-1)[positions] = 0.0
+        # with self.timer("reduce.reduce", verbosity=2):
+        #     if self.n_workers > 1:
+        #         worker_values = [torch.empty_like(values) for i in range(self.n_workers)]
+        #         worker_positions = [torch.empty_like(positions) for i in range(self.n_workers)]
+        #         h1 = all_gather(worker_values, values, async_op=True)
+        #         h2 = all_gather(worker_positions, positions, async_op=True)
+        #         h1.wait()
+        #         h2.wait()
+        #     else:
+        #         worker_values = [values]
+        #         worker_positions = [positions]
+        #     bits_communicated += n_bits(values) + n_bits(positions)
+        #     params_transmitted += values.numel()
+
+        # with self.timer("reduce.combine", verbosity=2):
+        #     for tensor, out, start, end in zip(
+        #         grad_in, grad_out, flatgrad_start_idx, flatgrad_end_idx
+        #     ):
+        #         out.data[:] = 0.0
+        #         for pos, val in zip(worker_positions, worker_values):
+        #             local_positions = pos[(pos >= start) & (pos < end)] - start
+        #             local_vals = val[(pos >= start) & (pos < end)]
+        #             out.view(-1)[local_positions] += local_vals / self.n_workers
+        # simulate_network_transfer(bits_communicated)
+        return bits_communicated, params_transmitted
+    
+    def communication_cost(self, T, log_d):
+        payload =  T*(32 + log_d)
+        cost = self.c_0*(payload/self.P_max) + self.c_1   # from A Flexible Framework for Communication-Efficient Machine Learning
+        return cost
+        
+
+
 def communication_cost(T, log_d):
     payload = T*(32 + log_d)
     cost = 576*(payload/512) + 64   # from A Flexible Framework for Communication-Efficient Machine Learning
