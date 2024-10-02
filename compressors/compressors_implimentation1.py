@@ -2,7 +2,9 @@ import math
 import torch
 import torch.distributed as dist
 
-
+# 
+# Modified from https://github.com/sands-lab/layer-wise-aaai20
+# 
 def layerwise_compressed_comm(
     model, world_size, method, current_epoch):
     total_size=0
@@ -61,12 +63,6 @@ def set_compreesion_split_and_level(group_splits_, group_compressions_, number_e
     number_epochs = number_epochs_
 
 
-# def set_compression_thresh_epoch(easy_compress, agg_compress, size_tresh, number_epochs):
-#     global K_thres, small_layer, epochs_number
-#     K_thres=[1, easy_compress/100, agg_compress/100]
-#     small_layer = size_tresh
-#     epochs_number = number_epochs
-
 
 def topk(flatten_grad, K):
     if K!=1:
@@ -91,7 +87,7 @@ def thresholdv(flatten_grad, V):
     return flatten_grad
 
 
-
+#Layer size based compression
 def layer_size_classification(flatten_grad):
     compression = group_compressions[-1]
     tensor_size = flatten_grad.numel()
@@ -101,7 +97,7 @@ def layer_size_classification(flatten_grad):
             break
     return compression
 
-
+#Epoch/Iteration based compression
 def iteration_calssification(current_epoch):
     compression = group_compressions[-1]
     epoch_portien= number_epochs/len(group_compressions)
@@ -111,6 +107,7 @@ def iteration_calssification(current_epoch):
             break
     return compression
 
+#Layer size + Epoch based compression
 def size_iteration_classification(current_epoch, flatten_grad):
     iteration_class = len(group_compressions)
     epoch_portien= number_epochs/len(group_compressions)
@@ -129,19 +126,19 @@ def size_iteration_classification(current_epoch, flatten_grad):
     
 
 def topk_compression(flatten_grad):
-    K=group_compressions[0]
+    K=group_compressions[0] # use the first compression parameter uniformaly on all layers 
     return topk(flatten_grad, K)
 
 def topk_layer(flatten_grad):
-    K=layer_size_classification(flatten_grad)
+    K=layer_size_classification(flatten_grad) # decide compression parameter based on layer size
     return topk(flatten_grad, K)
 
 def topk_adaptative(flatten_grad, current_epoch):
-    K=iteration_calssification(current_epoch)
+    K=iteration_calssification(current_epoch) # decide compression parameter based on training epoch
     return topk(flatten_grad, K)
 
 def topk_policy(flaten_grad, current_epoch):
-    K = size_iteration_classification(current_epoch, flaten_grad)
+    K = size_iteration_classification(current_epoch, flaten_grad)  # use both layer size and current epoch to decide the compression parameter
     return topk(flaten_grad, K)
 
 def randomk_compression(flatten_grad):
