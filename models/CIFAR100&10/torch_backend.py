@@ -101,7 +101,7 @@ def cifar100(root, batch_size):
 
 def imagenet(root,batch_size):
     # root='./data/tiny-imagenet-200'
-    root= '/home/mostapha.essoullami/lustre/opt_for_ml-um6p-sccs-en-tifcyqktztk/users/mostapha.essoullami/imagenet/imagenet'
+    root= '/imagenet/imagenet'
     # transform_train = transforms.Compose([
     #     transforms.RandomRotation(30), transforms.RandomHorizontalFlip(p=0.5),
     #     transforms.ToTensor(),#transforms.RandomErasing(),   # Converts images to tensors
