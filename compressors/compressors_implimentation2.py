@@ -8,6 +8,12 @@ from typing import List
 import numpy as np
 import torch
 
+
+# 
+# Modified from https://github.com/sands-lab/rethinking-sparsification
+# 
+
+
 communicated=[]
 
 def get_communicated():
@@ -36,13 +42,13 @@ class Reducer:
 
 class TopKLayerSizeReducer(Reducer):
     """
-    Use same amount as rank-based    train.config['group_splits'] = args.group_splits
+    train.config['group_splits'] = args.group_splits
     train.config['group_compressions'] =args.group_compressions
     """
     def __init__(self, random_seed, device, timer, group_splits='1000', group_compressions='1,0.1'):
         super().__init__(random_seed, device, timer)
-        self.group_split = [int(i) for i in group_splits.split(',')]
-        self.group_compressions = [float(i)/100 for i in group_compressions.split(',')]
+        self.group_split = [int(i) for i in group_splits.split(',')] # list of thresholds used to group layers
+        self.group_compressions = [float(i)/100 for i in group_compressions.split(',')] # list of compression parameters that will be used for each group
 
         print("grouping by sizes", self.group_split, 'using these compressions', self.group_compressions)
 
@@ -131,7 +137,7 @@ class TopKLayerSizeReducer(Reducer):
 
 class TopKEpochReducer(Reducer):
     """
-    Use same amount as rank-based
+    Use same approach of TopkLayerSize
     """
     def __init__(self, random_seed, device, timer, group_compressions='1,0.1', num_epochs=300):
         super().__init__(random_seed, device, timer)
@@ -716,14 +722,14 @@ class VarianceReducer(Reducer):
 
 
 
-class GlobalCATReducer(Reducer):
+class GlobalCATReducer(Reducer): # from A Flexible Framework for Communication-Efficient Machine Learning
     def __init__(self, random_seed, device, timer, c_0 = 1, c_1 = 60, P_max = 1460): #c_0 = 576, c_1 = 64, P_max = 512
         super().__init__(random_seed, device, timer)
         self.c_0 = c_0
         self.c_1 = c_1
         self.P_max = P_max
 
-        self.tau_max = math.floor(self.P_max/64)  # the number of gradient components (+ index) that can fit within a single communication packet
+        self.tau_max = math.floor(self.P_max/64)  # the number of gradient components (+ indeces) that can fit within a single communication packet
         print('tau max', self.tau_max, 'P_max', P_max)
     def reduce(self, grad_in, grad_out, memory_out):
         """
@@ -759,7 +765,7 @@ class GlobalCATReducer(Reducer):
             max_nb_iter = math.ceil(flatgrad.nelement()/self.tau_max)
             cumulative_sum = 0.0
             previous_ratio = 0.0
-            #### Packet model
+            #### Packet model #####
             # for i in range(max_nb_iter):
             #     cumulative_sum += squared_values[i*self.tau_max: (i+1)*self.tau_max].sum()
             #     nb_element = min((i+1)*self.tau_max, flatgrad.nelement())
@@ -892,7 +898,7 @@ class GlobalCATReducer(Reducer):
     
     def communication_cost(self, T, log_d):
         payload =  T*(32 + log_d)
-        cost = self.c_0*(payload/self.P_max) + self.c_1   # from A Flexible Framework for Communication-Efficient Machine Learning
+        cost = self.c_0*(payload/self.P_max) + self.c_1   
         return cost
         
 
